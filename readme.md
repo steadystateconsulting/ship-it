@@ -267,6 +267,17 @@ go run ./cmd/shipit run \
   --auto-approve-plan
 ```
 
+`run` prints the generated plan and the exact next command to execute it.
+
+Create, execute, and print the final report in one serial pass:
+
+```bash
+go run ./cmd/shipit run \
+  --goal "Exercise the Ship(it) loop" \
+  --repo . \
+  --full
+```
+
 Inspect the run:
 
 ```bash
@@ -343,6 +354,28 @@ Supported integration-test policies:
 * `never`: skip integration tests.
 
 Current executor behavior is intentionally local and deterministic. The planner and workers are stubs that exercise the control loop, artifact contracts, review gates, repair generation, checkpoint commits, final reports, and evaluations without calling external models.
+
+### OpenAI Planner
+
+The planner can call OpenAI's Responses API to generate the run spec and architecture note while Ship(it) still validates and owns the task graph.
+
+Set an API key:
+
+```bash
+export OPENAI_API_KEY="..."
+```
+
+Run with the OpenAI planner:
+
+```bash
+go run ./cmd/shipit run \
+  --goal "Plan the next Ship(it) feature" \
+  --repo . \
+  --planner openai \
+  --planner-model gpt-5-mini
+```
+
+If `--planner-model` is omitted, Ship(it) uses `SHIPIT_OPENAI_MODEL` and then falls back to `gpt-5-mini`.
 
 ---
 

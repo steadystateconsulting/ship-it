@@ -10,7 +10,9 @@ import (
 )
 
 type PlanOptions struct {
-	AutoApprove bool
+	AutoApprove  bool
+	Planner      string
+	PlannerModel string
 }
 
 func PlanRun(store *Store, run *Run, opts PlanOptions) error {
@@ -35,13 +37,27 @@ func PlanRun(store *Store, run *Run, opts PlanOptions) error {
 	workerInputPath := filepath.Join(taskDir, "worker-input.yaml")
 	workerResultPath := filepath.Join(taskDir, "worker-result.yaml")
 
+	if opts.Planner == "" {
+		opts.Planner = run.Planner
+	}
+	if opts.Planner == "" {
+		opts.Planner = "local"
+	}
+	if opts.PlannerModel == "" {
+		opts.PlannerModel = run.PlannerModel
+	}
+
 	if err := os.WriteFile(workerInputPath, []byte(renderPlannerInput(run, repoFiles)), 0644); err != nil {
 		return err
 	}
-	if err := os.WriteFile(specPath, []byte(renderSpec(run, repoFiles)), 0644); err != nil {
+	specText, archText, modelResponseID, err := generatePlanningDocuments(run, repoFiles, opts)
+	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(architecturePath, []byte(renderArchitecture(run)), 0644); err != nil {
+	if err := os.WriteFile(specPath, []byte(specText), 0644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(architecturePath, []byte(archText), 0644); err != nil {
 		return err
 	}
 
@@ -49,7 +65,7 @@ func PlanRun(store *Store, run *Run, opts PlanOptions) error {
 	if err := store.SaveTaskGraph(run, graph); err != nil {
 		return err
 	}
-	if err := os.WriteFile(workerResultPath, []byte(renderPlannerResult(run, specPath, architecturePath, graph)), 0644); err != nil {
+	if err := os.WriteFile(workerResultPath, []byte(renderPlannerResult(run, specPath, architecturePath, graph, opts, modelResponseID)), 0644); err != nil {
 		return err
 	}
 
@@ -64,6 +80,9 @@ func PlanRun(store *Store, run *Run, opts PlanOptions) error {
 			"architecture":       architecturePath,
 			"task_graph_version": graph.Version,
 			"task_count":         len(graph.Tasks),
+			"planner":            opts.Planner,
+			"planner_model":      opts.PlannerModel,
+			"model_response_id":  modelResponseID,
 		},
 	}); err != nil {
 		return err
@@ -257,20 +276,91 @@ func renderPlannerInput(run *Run, repoFiles []string) string {
 	return b.String()
 }
 
-func renderPlannerResult(run *Run, specPath, architecturePath string, graph TaskGraph) string {
+func generatePlanningDocuments(run *Run, repoFiles []string, opts PlanOptions) (string, string, string, error) {
+	if opts.Planner != "openai" {
+		return renderSpec(run, repoFiles), renderArchitecture(run), "", nil
+	}
+	client, err := NewOpenAIClient(opts.PlannerModel)
+	if err != nil {
+		return "", "", "", err
+	}
+	input := renderOpenAIPlannerPrompt(run, repoFiles)
+	output, responseID, err := client.CreateText(openAIPlannerInstructions(), input)
+	if err != nil {
+		return "", "", responseID, err
+	}
+	spec, arch := splitOpenAIPlan(output)
+	return spec, arch, responseID, nil
+}
+
+func renderPlannerResult(run *Run, specPath, architecturePath string, graph TaskGraph, opts PlanOptions, modelResponseID string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "worker_result:\n")
 	fmt.Fprintf(&b, "  run_id: %s\n", yamlQuote(run.RunID))
 	fmt.Fprintf(&b, "  task_id: %s\n", yamlQuote("plan-run"))
 	fmt.Fprintf(&b, "  role: %s\n", yamlQuote("planner"))
 	fmt.Fprintf(&b, "  status: %s\n", yamlQuote("completed"))
-	fmt.Fprintf(&b, "  summary: %s\n", yamlQuote("Generated local MVP planning artifacts."))
+	fmt.Fprintf(&b, "  summary: %s\n", yamlQuote("Generated MVP planning artifacts."))
+	fmt.Fprintf(&b, "  planner: %s\n", yamlQuote(opts.Planner))
+	if opts.PlannerModel != "" {
+		fmt.Fprintf(&b, "  planner_model: %s\n", yamlQuote(opts.PlannerModel))
+	}
+	if modelResponseID != "" {
+		fmt.Fprintf(&b, "  model_response_id: %s\n", yamlQuote(modelResponseID))
+	}
 	b.WriteString("  artifacts:\n")
 	fmt.Fprintf(&b, "    spec: %s\n", yamlQuote(relToRun(run, specPath)))
 	fmt.Fprintf(&b, "    architecture: %s\n", yamlQuote(relToRun(run, architecturePath)))
 	fmt.Fprintf(&b, "    task_graph: %s\n", yamlQuote("task-graph.v1.yaml"))
 	fmt.Fprintf(&b, "  task_count: %d\n", len(graph.Tasks))
 	return b.String()
+}
+
+func openAIPlannerInstructions() string {
+	return strings.Join([]string{
+		"You are the Ship(it) planner.",
+		"Produce practical planning artifacts for a local software-delivery control loop.",
+		"Do not claim implementation has happened.",
+		"Return Markdown with exactly two top-level sections:",
+		"# MVP Run Spec",
+		"# MVP Run Architecture Note",
+		"Keep the output concise, specific to the repository files and user order, and implementation-ready.",
+	}, "\n")
+}
+
+func renderOpenAIPlannerPrompt(run *Run, repoFiles []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Run ID: %s\n", run.RunID)
+	fmt.Fprintf(&b, "Order: %s\n", run.Goal)
+	fmt.Fprintf(&b, "Mode: %s\n", run.Mode)
+	fmt.Fprintf(&b, "Dirty state strategy: %s\n", run.DirtyStateStrategy)
+	fmt.Fprintf(&b, "Integration test policy: %s\n\n", run.IntegrationTestsBlocking)
+	b.WriteString("Repository file sample:\n")
+	for _, file := range repoFiles {
+		fmt.Fprintf(&b, "- %s\n", file)
+	}
+	b.WriteString("\nTask graph shape will be generated by Ship(it); focus on the run spec and architecture note.\n")
+	return b.String()
+}
+
+func splitOpenAIPlan(output string) (string, string) {
+	output = strings.TrimSpace(output)
+	const archHeader = "# MVP Run Architecture Note"
+	idx := strings.Index(output, archHeader)
+	if idx < 0 {
+		return ensureHeading(output, "# MVP Run Spec"), "# MVP Run Architecture Note\n\nOpenAI planner did not provide a separate architecture section.\n"
+	}
+	spec := strings.TrimSpace(output[:idx])
+	arch := strings.TrimSpace(output[idx:])
+	return ensureHeading(spec, "# MVP Run Spec"), ensureHeading(arch, archHeader)
+}
+
+func ensureHeading(text, heading string) string {
+	text = strings.TrimSpace(text)
+	if strings.HasPrefix(text, heading) {
+		return text + "\n"
+	}
+	return heading + "\n\n" + text + "\n"
 }
 
 func renderSpec(run *Run, repoFiles []string) string {

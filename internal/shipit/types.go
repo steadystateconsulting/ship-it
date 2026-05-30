@@ -52,6 +52,8 @@ type Run struct {
 	OriginalGitStatus                 []string  `json:"original_git_status"`
 	PlanApprovalRequired              bool      `json:"plan_approval_required"`
 	PlanApproved                      bool      `json:"plan_approved"`
+	Planner                           string    `json:"planner"`
+	PlannerModel                      string    `json:"planner_model,omitempty"`
 	TaskGraphVersion                  string    `json:"task_graph_version,omitempty"`
 	TaskGraphPath                     string    `json:"task_graph_path,omitempty"`
 	DirtyStateStrategy                string    `json:"dirty_state_strategy"`

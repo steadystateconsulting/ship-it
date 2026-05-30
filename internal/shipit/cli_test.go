@@ -24,6 +24,12 @@ func TestRunStatusLogAndCancel(t *testing.T) {
 	if !strings.Contains(out.String(), "created run run_test") || !strings.Contains(out.String(), "state: awaiting_plan_approval") {
 		t.Fatalf("unexpected output: %s", out.String())
 	}
+	if !strings.Contains(out.String(), "Plan\n- inspect-repository") {
+		t.Fatalf("run output did not include plan: %s", out.String())
+	}
+	if !strings.Contains(out.String(), "go run ./cmd/shipit execute \\\n  --run run_test \\\n  --repo . \\\n  --max-tasks 10") {
+		t.Fatalf("run output did not include concrete next command: %s", out.String())
+	}
 
 	out.Reset()
 	if err := Main([]string{"status", "--repo", repo, "--run", "run_test"}, &out, &out); err != nil {
@@ -126,6 +132,30 @@ func TestRunCanAutoApprovePlan(t *testing.T) {
 		if !strings.Contains(string(runYAML), expected) {
 			t.Fatalf("run policy missing %q from run.yaml:\n%s", expected, string(runYAML))
 		}
+	}
+}
+
+func TestRunFullExecutesAndPrintsReport(t *testing.T) {
+	repo := initTestRepo(t)
+	var out bytes.Buffer
+	if err := Main([]string{
+		"run",
+		"--goal", "Run full loop",
+		"--repo", repo,
+		"--run-id", "run_full",
+		"--full",
+	}, &out, &out); err != nil {
+		t.Fatal(err)
+	}
+	output := out.String()
+	if !strings.Contains(output, "Executing serial run...") {
+		t.Fatalf("full run did not execute: %s", output)
+	}
+	if !strings.Contains(output, "# Final Delivery Report") {
+		t.Fatalf("full run did not print final report: %s", output)
+	}
+	if !strings.Contains(output, "run run_full -> completed") {
+		t.Fatalf("full run did not complete: %s", output)
 	}
 }
 

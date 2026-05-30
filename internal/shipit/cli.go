@@ -59,6 +59,9 @@ func runCommand(args []string, stdout io.Writer) error {
 	mode := fs.String("mode", "local", "run mode")
 	runIDOverride := fs.String("run-id", "", "explicit run ID")
 	autoApprovePlan := fs.Bool("auto-approve-plan", false, "skip plan approval and move to execution")
+	fullRun := fs.Bool("full", false, "create the run, execute serially, and print the final report")
+	planner := fs.String("planner", "local", "planner backend: local or openai")
+	plannerModel := fs.String("planner-model", "", "model for --planner openai")
 	dirtyStateStrategy := fs.String("dirty-state-strategy", "fix_in_place", "fix_in_place, orchestrator_rollback, or executor_discretion")
 	maxParallelTasks := fs.Int("max-parallel-tasks", 1, "scheduler parallelism policy knob; execution remains serial in MVP")
 	integrationTestsBlocking := fs.String("integration-tests-blocking", "when_runnable", "when_runnable, always, or never")
@@ -77,6 +80,12 @@ func runCommand(args []string, stdout io.Writer) error {
 	}
 	if err := validateRunPolicy(*maxParallelTasks, *integrationTestsBlocking, *failureThreshold); err != nil {
 		return err
+	}
+	if err := validatePlanner(*planner); err != nil {
+		return err
+	}
+	if *planner == "openai" && *plannerModel == "" {
+		*plannerModel = defaultOpenAIModel()
 	}
 
 	store, err := NewStore(*repo)
@@ -120,6 +129,8 @@ func runCommand(args []string, stdout io.Writer) error {
 		WorkspaceDir:                      filepath.Join(runDir, "workspace"),
 		Branch:                            "shipit/" + time.Now().Format("20060102") + "-" + slugify(*goal) + "-" + shortRunID(runID),
 		PlanApprovalRequired:              !*autoApprovePlan,
+		Planner:                           *planner,
+		PlannerModel:                      *plannerModel,
 		DirtyStateStrategy:                *dirtyStateStrategy,
 		MaxParallelTasks:                  *maxParallelTasks,
 		IntegrationTestsBlocking:          *integrationTestsBlocking,
@@ -174,12 +185,38 @@ func runCommand(args []string, stdout io.Writer) error {
 	if err := TransitionRun(store, run, StatePlanning, "Run initialized and ready for planning."); err != nil {
 		return err
 	}
-	if err := PlanRun(store, run, PlanOptions{AutoApprove: *autoApprovePlan}); err != nil {
+	if err := PlanRun(store, run, PlanOptions{AutoApprove: *autoApprovePlan || *fullRun, Planner: *planner, PlannerModel: *plannerModel}); err != nil {
 		_ = TransitionRun(store, run, StateBlocked, "Run blocked while generating plan.")
 		return err
 	}
 
-	fmt.Fprintf(stdout, "created run %s\nstate: %s\nrun_dir: %s\nworkspace: %s\nbranch: %s\n", run.RunID, run.State, run.RunDir, run.WorkspaceDir, run.Branch)
+	fmt.Fprintf(stdout, "created run %s\nstate: %s\nrun_dir: %s\nworkspace: %s\nbranch: %s\n\n", run.RunID, run.State, run.RunDir, run.WorkspaceDir, run.Branch)
+	if err := printPlanSummary(stdout, store, run); err != nil {
+		return err
+	}
+	if *fullRun {
+		fmt.Fprintln(stdout)
+		fmt.Fprintln(stdout, "Executing serial run...")
+		results, err := ExecuteRun(store, run, ExecuteOptions{MaxTasks: 100})
+		if err != nil {
+			return err
+		}
+		for _, result := range results {
+			if result.Done {
+				fmt.Fprintf(stdout, "run %s -> %s\n", run.RunID, result.Status)
+			} else {
+				fmt.Fprintf(stdout, "task %s -> %s\n", result.TaskID, result.Status)
+			}
+		}
+		reportPath := filepath.Join(run.RunDir, "artifacts", "reports", "final-delivery-report.md")
+		report, err := os.ReadFile(reportPath)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout)
+		_, err = stdout.Write(report)
+		return err
+	}
 	return nil
 }
 
@@ -219,6 +256,42 @@ func reportCommand(args []string, stdout io.Writer) error {
 	}
 	_, err = stdout.Write(data)
 	return err
+}
+
+func printPlanSummary(stdout io.Writer, store *Store, run *Run) error {
+	graph, err := store.LoadTaskGraph(run)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "Plan")
+	for _, task := range graph.Tasks {
+		deps := "-"
+		if len(task.Dependencies) > 0 {
+			deps = strings.Join(task.Dependencies, ",")
+		}
+		fmt.Fprintf(stdout, "- %s (%s): %s [deps: %s]\n", task.ID, task.Type, task.Title, deps)
+	}
+	if run.State == StateAwaitingPlan {
+		fmt.Fprintln(stdout)
+		fmt.Fprintln(stdout, "Ready to approve?")
+		fmt.Fprintf(stdout, "go run ./cmd/shipit approve-plan --run %s --repo .\n", run.RunID)
+	}
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(stdout, "Ready to execute?")
+	fmt.Fprintln(stdout, "go run ./cmd/shipit execute \\")
+	fmt.Fprintf(stdout, "  --run %s \\\n", run.RunID)
+	fmt.Fprintln(stdout, "  --repo . \\")
+	fmt.Fprintln(stdout, "  --max-tasks 10")
+	return nil
+}
+
+func validatePlanner(planner string) error {
+	switch planner {
+	case "local", "openai":
+		return nil
+	default:
+		return fmt.Errorf("unsupported planner %q", planner)
+	}
 }
 
 func indexCommand(args []string, stdout io.Writer) error {
@@ -348,7 +421,7 @@ func resumeCommand(args []string, stdout io.Writer) error {
 		}
 	}
 	if run.State == StatePlanning {
-		if err := PlanRun(store, run, PlanOptions{AutoApprove: !run.PlanApprovalRequired}); err != nil {
+		if err := PlanRun(store, run, PlanOptions{AutoApprove: !run.PlanApprovalRequired, Planner: run.Planner, PlannerModel: run.PlannerModel}); err != nil {
 			if txErr := TransitionRun(store, run, StateBlocked, "Run blocked while generating plan."); txErr != nil {
 				return txErr
 			}
@@ -444,6 +517,7 @@ func loadRunFromFlags(name string, args []string) (*Run, *Store, error) {
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage:")
 	fmt.Fprintln(w, "  shipit run --goal <goal> --repo <path> [--profile <path>] [--mode local] [--auto-approve-plan]")
+	fmt.Fprintln(w, "             [--full] [--planner local|openai] [--planner-model <model>]")
 	fmt.Fprintln(w, "             [--max-parallel-tasks 1] [--integration-tests-blocking when_runnable|always|never]")
 	fmt.Fprintln(w, "             [--dirty-state-strategy fix_in_place|orchestrator_rollback|executor_discretion]")
 	fmt.Fprintln(w, "  shipit status --run <run_id> [--repo <path>]")

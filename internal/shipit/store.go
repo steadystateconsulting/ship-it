@@ -206,6 +206,12 @@ func renderRunYAML(run *Run) string {
 	fmt.Fprintf(&b, "branch: %s\n", yamlQuote(run.Branch))
 	fmt.Fprintf(&b, "plan_approval_required: %t\n", run.PlanApprovalRequired)
 	fmt.Fprintf(&b, "plan_approved: %t\n", run.PlanApproved)
+	if run.Planner != "" {
+		fmt.Fprintf(&b, "planner: %s\n", yamlQuote(run.Planner))
+	}
+	if run.PlannerModel != "" {
+		fmt.Fprintf(&b, "planner_model: %s\n", yamlQuote(run.PlannerModel))
+	}
 	if run.DirtyStateStrategy != "" {
 		fmt.Fprintf(&b, "dirty_state_strategy: %s\n", yamlQuote(run.DirtyStateStrategy))
 	}
